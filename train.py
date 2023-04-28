@@ -15,18 +15,19 @@
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
+from typing import Optional, Dict, Sequence
 
 import torch
 import transformers
-import utils
 from torch.utils.data import Dataset
 from transformers import Trainer
 
+import utils
+print('transformers version: ', transformers.__version__)
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
-DEFAULT_EOS_TOKEN = "</s>"
-DEFAULT_BOS_TOKEN = "<s>"
+DEFAULT_EOS_TOKEN = "<s>"
+DEFAULT_BOS_TOKEN = "</s>"
 DEFAULT_UNK_TOKEN = "<unk>"
 PROMPT_DICT = {
     "prompt_input": (
@@ -50,6 +51,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    lazy_preprocess: bool = False
 
 
 @dataclass
@@ -60,6 +62,15 @@ class TrainingArguments(transformers.TrainingArguments):
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
+
+
+def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
+    """Collects the state dict and dump to disk."""
+    state_dict = trainer.model.state_dict()
+    if trainer.args.should_save:
+        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+        del state_dict
+        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -131,26 +142,72 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
         list_data_dict = utils.jload(data_path)
+        if 'alpaca_cach' in data_path: 
+            input_ids = []
+            labels = []
+            for example in list_data_dict:
+                input_id, label = example['input_ids'], example['labels']
+                input_id = torch.tensor(input_id)
+                label = torch.tensor(label)
+                input_ids
 
-        logging.warning("Formatting inputs...")
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-        sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-            for example in list_data_dict
-        ]
-        targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
+        else:
 
-        logging.warning("Tokenizing inputs... This may take some time...")
-        data_dict = preprocess(sources, targets, tokenizer)
+            logging.warning("Formatting inputs...")
+            prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+            sources = [
+                prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+                for example in list_data_dict
+            ]
+            targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
 
-        self.input_ids = data_dict["input_ids"]
-        self.labels = data_dict["labels"]
+            logging.warning("Tokenizing inputs... This may take some time...")
+            data_dict = preprocess(sources, targets, tokenizer)
+
+            self.input_ids = data_dict["input_ids"] # list of torch tensor
+            self.labels = data_dict["labels"]
 
     def __len__(self):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         return dict(input_ids=self.input_ids[i], labels=self.labels[i])
+
+
+class LazySupervisedDataset(Dataset):  
+    """Dataset for supervised fine-tuning."""
+
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
+        super(LazySupervisedDataset, self).__init__()
+        logging.warning("Loading data...")
+        list_data_dict = utils.jload(data_path)
+        
+        logging.warning("Formatting inputs...")
+        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+        sources = [
+            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+            for example in list_data_dict
+        ]
+        targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]  # ! 这里加了eos
+
+        self.examples = [s + t for s, t in zip(sources, targets)]
+        self.tokenizer = tokenizer
+        self.sources = sources
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        examples_tokenized = _tokenize_fn([self.examples[i]], self.tokenizer)
+        sources_tokenized = _tokenize_fn([self.sources[i]], self.tokenizer)
+
+        input_ids = examples_tokenized["input_ids"]
+        labels = copy.deepcopy(input_ids)
+        for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
+            label[:source_len] = IGNORE_INDEX
+
+        return dict(input_ids=input_ids[0], labels=labels[0])
+
 
 
 @dataclass
@@ -174,7 +231,11 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    if data_args.lazy_preprocess:
+        print("使用lazy数据处理方式..")
+        train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    else:
+        train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
@@ -186,6 +247,7 @@ def train():
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
+        # torch_dtype=torch.float16
     )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -195,27 +257,27 @@ def train():
         padding_side="right",
         use_fast=False,
     )
-    special_tokens_dict = dict()
     if tokenizer.pad_token is None:
-        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
-    if tokenizer.eos_token is None:
-        special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
-    if tokenizer.bos_token is None:
-        special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
-    if tokenizer.unk_token is None:
-        special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
-
-    smart_tokenizer_and_embedding_resize(
-        special_tokens_dict=special_tokens_dict,
-        tokenizer=tokenizer,
-        model=model,
-    )
+        smart_tokenizer_and_embedding_resize(
+            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
+            tokenizer=tokenizer,
+            model=model,
+        )
+    if "llama" in model_args.model_name_or_path:
+        tokenizer.add_special_tokens(
+            {
+                "eos_token": DEFAULT_EOS_TOKEN,
+                "bos_token": DEFAULT_BOS_TOKEN,
+                "unk_token": DEFAULT_UNK_TOKEN,
+            }
+        )
+    tokenizer.model_max_length = 2048
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
     trainer.save_state()
-    trainer.save_model(output_dir=training_args.output_dir)
+    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
